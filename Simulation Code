@@ -1,0 +1,191 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =========================
+# CONFIG
+# =========================
+N_DAYS = 2                   # Simulate this many days
+BASE_PRICE = 120.0           # $/MWh average level
+DAILY_VOL = 25.0             # Std dev (30-min macro noise)
+INTRABLOCK_VOL = 2.0         # Std dev of 30-second shocks inside each 30-min block
+MEAN_REVERT_HALF_LIFE_MIN = 90      # Mean reversion half-life (minutes) for 30-min process
+MICRO_MEAN_REVERT_HALF_LIFE_SEC = 300  # Mean reversion half-life (seconds) inside block
+SEED = 42
+TIMEZONE = "Pacific/Auckland"
+
+# Arbitrage strategy parameters
+DEVIATION_ENTRY_THRESHOLD = 2.0   # $/MWh deviation from 30-min anchor to open position
+TAKE_PROFIT = 1.0                 # $/MWh profit target vs anchor to close
+STOP_LOSS = 3.0                   # $/MWh adverse move to stop out
+MAX_HOLD_SECONDS = 15 * 60        # Force close after this many seconds (time-based exit)
+
+np.random.seed(SEED)
+
+# =========================
+# 1. Generate 30-minute time grid
+# =========================
+start = pd.Timestamp("2025-01-01 00:00:00", tz=TIMEZONE)
+n_blocks = N_DAYS * 48  # 48 half-hours per day
+block_times = start + pd.to_timedelta(np.arange(n_blocks) * 30, unit="min")
+
+# =========================
+# 2. Simulate a mean-reverting 30-minute (macro) price process
+# Ornstein-Uhlenbeck discrete form:
+#   X_{t+Δ} = X_t * exp(-kΔ) + μ(1 - exp(-kΔ)) + σ * sqrt((1 - exp(-2kΔ))/(2k)) * N(0,1)
+# Half-life h => k = ln(2)/h
+# =========================
+k_30m = np.log(2) / MEAN_REVERT_HALF_LIFE_MIN
+dt_min = 30.0  # each macro step is 30 minutes
+decay = np.exp(-k_30m * dt_min)
+sigma_macro = DAILY_VOL  # direct scale for macro increments (rough)
+macro_prices = [BASE_PRICE]
+
+for _ in range(1, n_blocks):
+    prev = macro_prices[-1]
+    mean_term = BASE_PRICE * (1 - decay)
+    noise_term = sigma_macro * np.sqrt(1 - decay**2) * np.random.randn()
+    new_val = prev * decay + mean_term + noise_term
+    macro_prices.append(new_val)
+
+poc30 = pd.DataFrame({"price_30m": macro_prices}, index=block_times)
+
+# =========================
+# 3. Expand to 30-second resolution with microstructure noise
+# Each 30-min block -> 60 intervals (30 s each) = 30*60 / 30 = 60
+# We'll use an intra-block OU around the block anchor (its 30-min macro price)
+# =========================
+seconds_per_block = 30 * 60
+interval = 30  # seconds
+steps_per_block = seconds_per_block // interval
+
+k_micro = np.log(2) / MICRO_MEAN_REVERT_HALF_LIFE_SEC
+dt_sec = interval
+decay_micro = np.exp(-k_micro * dt_sec)
+sigma_micro = INTRABLOCK_VOL
+
+micro_segments = []
+for block_start_time, row in poc30.iterrows():
+    anchor = row["price_30m"]
+    # Start micro path at anchor
+    micro_vals = [anchor]
+    for _ in range(1, steps_per_block):
+        prev = micro_vals[-1]
+        mean_term = anchor * (1 - decay_micro)
+        noise = sigma_micro * np.sqrt(1 - decay_micro**2) * np.random.randn()
+        micro_vals.append(prev * decay_micro + mean_term + noise)
+
+    # Time index for this block at 30s spacing
+    idx = block_start_time + pd.to_timedelta(np.arange(steps_per_block) * interval, unit="s")
+    seg = pd.DataFrame({"price_30s": micro_vals}, index=idx)
+    micro_segments.append(seg)
+
+poc30s = pd.concat(micro_segments).sort_index()
+
+# =========================
+# 4. Simple mean-reversion arbitrage strategy
+# Idea:
+#  - For each 30-second point, compare price_30s to the anchor (the block's 30-min price)
+#  - If deviation > threshold: short (expect revert down); if deviation < -threshold: long
+#  - Exit on take profit, stop loss, or max hold time
+# =========================
+
+def find_anchor(ts):
+    # Determine which 30-min block ts belongs to by flooring to 30-min boundary
+    block_ts = (ts.floor("30min"))
+    return poc30.loc[block_ts, "price_30m"]
+
+positions = []  # each position: dict with keys: entry_time, side (1 long / -1 short), entry_price, anchor, exit_time, exit_price, pnl
+open_pos = None
+
+for current_time, row in poc30s.iterrows():
+    price = row["price_30s"]
+    anchor_price = find_anchor(current_time)
+    deviation = price - anchor_price
+
+    # Check existing position
+    if open_pos:
+        side = open_pos["side"]
+        # Unrealized P&L relative to anchor-based logic (we close vs current price)
+        move = (price - open_pos["entry_price"]) * side  # side=1 long: gain if price up
+        dev_from_anchor = (price - anchor_price) * side
+
+        hold_time = (current_time - open_pos["entry_time"]).total_seconds()
+
+        # Exit conditions
+        hit_tp = dev_from_anchor <= -TAKE_PROFIT if side == -1 else dev_from_anchor >= TAKE_PROFIT
+        hit_sl = dev_from_anchor >= STOP_LOSS if side == -1 else dev_from_anchor <= -STOP_LOSS
+        hit_time = hold_time >= MAX_HOLD_SECONDS
+
+        if hit_tp or hit_sl or hit_time:
+            open_pos["exit_time"] = current_time
+            open_pos["exit_price"] = price
+            open_pos["pnl"] = (open_pos["exit_price"] - open_pos["entry_price"]) * open_pos["side"]
+            positions.append(open_pos)
+            open_pos = None
+
+    # Maybe open a new position (only if none open)
+    if open_pos is None:
+        if deviation > DEVIATION_ENTRY_THRESHOLD:
+            # Price above anchor -> expect revert down -> short
+            open_pos = {
+                "entry_time": current_time,
+                "side": -1,
+                "entry_price": price,
+                "anchor": anchor_price
+            }
+        elif deviation < -DEVIATION_ENTRY_THRESHOLD:
+            # Price below anchor -> expect revert up -> long
+            open_pos = {
+                "entry_time": current_time,
+                "side": 1,
+                "entry_price": price,
+                "anchor": anchor_price
+            }
+
+# If any open position left at end, close at last price
+if open_pos:
+    last_price = poc30s.iloc[-1]["price_30s"]
+    open_pos["exit_time"] = poc30s.index[-1]
+    open_pos["exit_price"] = last_price
+    open_pos["pnl"] = (last_price - open_pos["entry_price"]) * open_pos["side"]
+    positions.append(open_pos)
+
+trades = pd.DataFrame(positions)
+if not trades.empty:
+    trades["holding_seconds"] = (trades["exit_time"] - trades["entry_time"]).dt.total_seconds()
+    cumulative_pnl = trades["pnl"].cumsum()
+else:
+    cumulative_pnl = pd.Series(dtype=float)
+
+# =========================
+# 5. Plotting
+# =========================
+plt.figure(figsize=(14,6))
+plt.plot(poc30.index, poc30["price_30m"], label="30-min Anchor Price", linewidth=2)
+plt.plot(poc30s.index, poc30s["price_30s"], label="30-sec Micro Price", alpha=0.6)
+plt.title("Simulated NZ Electricity Prices: 30-min vs 30-sec Microstructure")
+plt.xlabel("Time")
+plt.ylabel("Price ($/MWh)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+if not trades.empty:
+    plt.figure(figsize=(14,4))
+    plt.plot(trades["exit_time"], cumulative_pnl, marker="o")
+    plt.title("Cumulative P&L (Mean-Reversion Arbitrage)")
+    plt.xlabel("Time")
+    plt.ylabel("P&L ($/MWh * notional 1)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    display(trades.head())
+    print("Total Trades:", len(trades))
+    print("Total P&L:", trades["pnl"].sum())
+    print("Win %:", (trades["pnl"] > 0).mean() if len(trades) else np.nan)
+    print("Avg Hold (s):", trades["holding_seconds"].mean())
+else:
+    print("No trades triggered. Consider lowering DEVIATION_ENTRY_THRESHOLD or increasing volatility.")
